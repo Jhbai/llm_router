@@ -91,6 +91,9 @@ TOOLS = [
         }
     }
 ]
+class AgentRuntimeAbortError(Exception): pass
+class ControlledStopError(Exception): pass
+class ProviderError(Exception): pass
 
 def _parse_cline_xml_tools(content: str) -> list:
     calls = []
@@ -100,22 +103,12 @@ def _parse_cline_xml_tools(content: str) -> list:
         for pm in re.finditer(r'<parameter\s+name="([^"]+)">([\s\S]*?)</parameter>', m.group(2)):
             args[pm.group(1)] = pm.group(2).strip()
         
-        if name == "editor" and args.get("command") == "write_file":
-            mapped_name = "write_to_file"
-            mapped_args = {"path": args.get("path", ""), "content": args.get("content", "")}
-        elif name == "run_commands":
-            mapped_name = "run_commands"
+        mapped_name = "write_to_file" if name == "editor" and args.get("command") == "write_file" else name
+        mapped_args = {"path": args.get("path", ""), "content": args.get("content", "")} if mapped_name == "write_to_file" else args
+        if mapped_name == "run_commands":
             cmd = args.get("commands", "")
-            if cmd.startswith("[") and cmd.endswith("]"):
-                try:
-                    cmd = " && ".join(json.loads(cmd))
-                except Exception:
-                    pass
-            mapped_args = {"command": cmd}
-        else:
-            mapped_name = name
-            mapped_args = args
-
+            mapped_args = {"command": " && ".join(json.loads(cmd)) if cmd.startswith("[") else cmd}
+            
         calls.append({
             "id": f"call_{uuid.uuid4().hex[:10]}",
             "type": "function",
@@ -123,27 +116,26 @@ def _parse_cline_xml_tools(content: str) -> list:
         })
     return calls
 
-def _sync_call_llm_stream(url: str, token: str, messages: list) -> dict:
+def _sync_call_llm_stream(url: str, token: str, messages: list):
     payload = {"model": "gemini-3.8-flash", "messages": messages, "stream": True, "tools": TOOLS}
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     
-    with requests.post(url, json=payload, headers=headers, stream=True) as resp:
+    with requests.post(url, json=payload, headers=headers, stream=True, timeout=30) as resp:
         if resp.status_code != 200:
-            print(f"\n[HTTP Error] {resp.status_code}: {resp.text}")
-            return {"role": "assistant", "content": f"[Error] HTTP {resp.status_code}", "tool_calls": None}
+            raise ProviderError(f"HTTP {resp.status_code}: {resp.text}")
             
-        full_content = ""
-        t_calls = {}
+        full_content, t_calls, finish_reason = "", {}, None
         
         for line in resp.iter_lines(decode_unicode=True):
             if line.startswith("data: ") and line != "data: [DONE]":
                 try:
                     data = json.loads(line[6:])
                     if "error" in data:
-                        print(f"\n[Server Error]: {data['error']}")
-                        continue
+                        raise ProviderError(data['error'])
                         
-                    delta = data["choices"][0].get("delta", {})
+                    choice = data["choices"][0]
+                    delta = choice.get("delta", {})
+                    finish_reason = choice.get("finish_reason") or finish_reason
                     
                     if "content" in delta and delta["content"]:
                         sys.stdout.write(delta["content"])
@@ -163,80 +155,151 @@ def _sync_call_llm_stream(url: str, token: str, messages: list) -> dict:
             print()
             
     res_msg = {"role": "assistant", "content": full_content}
-    if t_calls:
-        res_msg["tool_calls"] = list(t_calls.values())
-    else:
-        xml_calls = _parse_cline_xml_tools(full_content)
-        if xml_calls:
-            res_msg["tool_calls"] = xml_calls
-            
-    return res_msg
+    tools = list(t_calls.values()) if t_calls else _parse_cline_xml_tools(full_content)
+    if tools:
+        res_msg["tool_calls"] = tools
+    return res_msg, finish_reason
 
-def _sync_execute_tool_calls(tool_calls: list) -> list:
-    results = []
-    for tc in tool_calls:
-        name = tc["function"]["name"]
+async def safe_call_llm(url: str, token: str, messages: list, max_retries: int = 3):
+    for attempt in range(max_retries):
         try:
-            args = json.loads(tc["function"]["arguments"])
-            if name == "read_files":
-                res = []
-                for f in args.get("files", []):
-                    path = os.path.abspath(f["path"])
-                    with open(path, "r", encoding="utf-8") as file:
-                        lines = file.readlines()
-                        start = max(1, f.get("start_line", 1)) - 1
-                        end = f.get("end_line", len(lines))
-                        res.append({"path": f["path"], "content": "".join(lines[start:end])})
-                out = {"files": res}
-            elif name == "write_to_file":
-                path = os.path.abspath(args["path"])
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                content = args.get("content", args.get("new_text", ""))
-                with open(path, "w", encoding="utf-8") as file:
-                    file.write(content)
-                out = {"status": "success", "bytes": len(content.encode('utf-8'))}
-            elif name == "run_commands":
-                proc = subprocess.run(
-                    args["command"], shell=True, capture_output=True, text=True, 
-                    timeout=args.get("timeout", 30000)/1000.0
-                )
-                out = {"stdout": proc.stdout, "stderr": proc.stderr, "exitCode": proc.returncode}
-            else:
-                out = {"error": f"Unknown tool: {name}"}
-        except Exception as e:
-            out = {"error": str(e)}
-            
-        results.append({
-            "tool_call_id": tc["id"],
-            "role": "tool",
-            "name": name,
-            "content": json.dumps(out, ensure_ascii=False)
-        })
-    return results
+            return await asyncio.to_thread(_sync_call_llm_stream, url, token, messages)
+        except (requests.RequestException, ProviderError) as e:
+            if attempt == max_retries - 1:
+                raise e
+            await asyncio.sleep(2 ** attempt)
 
-async def agent_loop(url: str, token: str, messages: list, max_steps: int = 8):
-    for step in range(1, max_steps + 1):
-        print(f"\n--- Agent Step {step}/{max_steps} ---")
+async def agent_loop(url: str, token: str, messages: list, config: dict = None):
+    config = config or {"maxIterations": 8, "maxConsecutiveMistakes": 6}
+    abort_event = asyncio.Event() 
+    
+    consecutive_mistakes = 0
+    reminders_issued = 0
+    previous_tool_signature = None
+    repeated_tool_count = 0
+
+    # 1. Lifecycle Hook: beforeRun
+    print("[Hook] beforeRun invoked")
+    
+    for step in range(1, config["maxIterations"] + 1):
+        if abort_event.is_set():
+            raise AgentRuntimeAbortError("Run aborted by user/system signal.")
+            
+        print(f"\n--- Agent Step {step}/{config['maxIterations']} ---")
         
-        assistant_msg = await asyncio.to_thread(_sync_call_llm_stream, url, token, messages)
+        try:
+            assistant_msg, finish_reason = await safe_call_llm(url, token, messages)
+        except Exception as e:
+            raise ProviderError(f"Provider Retries Exhausted: {str(e)}")
+
+        # 2. Model Streaming Termination Criteria Evaluation
+        content_empty = not assistant_msg.get("content", "").strip()
+        has_tools = bool(assistant_msg.get("tool_calls"))
+
+        if finish_reason == "aborted":
+            raise AgentRuntimeAbortError("Stream aborted by provider.")
+        elif content_empty and not has_tools:
+            if finish_reason == "error":
+                raise ProviderError("Provider error with empty response.")
+            raise ValueError("Model returned empty response without tool calls.")
+        elif finish_reason == "max_tokens" and not has_tools:
+            raise RuntimeError("Fatal: Max context limit reached before tool emission.")
+
         messages.append(assistant_msg)
         
-        if not assistant_msg.get("tool_calls"):
-            print("\n[Termination] 任務已完成 (未呼叫工具)")
-            break
-            
+        # 3. Loop Progression & Goal Completion
+        if not has_tools:
+            if reminders_issued < 1:
+                reminders_issued += 1
+                messages.append({"role": "user", "content": "Please invoke tools or finalize the answer using attempt_completion."})
+                continue
+            else:
+                print("\n[Termination] Explicit finalization skipped; Run completed implicitly.")
+                break
+
+        # 4. Guardrails: Repetitive Tool Detection
+        current_sig = hashlib.md5(json.dumps([tc["function"] for tc in assistant_msg["tool_calls"]], sort_keys=True).encode()).hexdigest()
+        if current_sig == previous_tool_signature:
+            repeated_tool_count += 1
+            if repeated_tool_count == 2:
+                messages.append({"role": "user", "content": "You are repeating the same action. Please try an alternate approach."})
+                continue
+            elif repeated_tool_count > 2:
+                consecutive_mistakes += 1
+        else:
+            previous_tool_signature = current_sig
+            repeated_tool_count = 0
+
+        # 5. Tool Approval & Human Intervention
         print("\n[Pending Tools]:", [tc["function"]["name"] for tc in assistant_msg["tool_calls"]])
         approval = await asyncio.to_thread(input, "允許執行上述工具嗎？(Y/n): ")
+        
         if approval.strip().lower() == 'n':
-            print("\n[Termination] 使用者拒絕授權，循環終止。")
-            messages.append({"role": "user", "content": "The user denied the tool execution. Task aborted."})
+            rejection_results = [{
+                "tool_call_id": tc["id"],
+                "role": "tool",
+                "name": tc["function"]["name"],
+                "content": json.dumps({"error": "User denied authorization."})
+            } for tc in assistant_msg["tool_calls"]]
+            messages.extend(rejection_results)
+            consecutive_mistakes += 1
+            continue
+
+        # Execute Tools
+        tool_results = []
+        all_failed = True
+        run_completed = False
+        
+        for tc in assistant_msg["tool_calls"]:
+            name = tc["function"]["name"]
+            try:
+                args = json.loads(tc["function"]["arguments"])
+                if name == "attempt_completion":
+                    out = {"status": "success", "result": args.get("result", "")}
+                    run_completed = True
+                    all_failed = False
+                elif name == "read_files":
+                    res = [{"path": f["path"], "content": open(f["path"], "r", encoding="utf-8").read()} for f in args.get("files", [])]
+                    out = {"files": res}
+                    all_failed = False
+                elif name == "write_to_file":
+                    os.makedirs(os.path.dirname(args["path"]), exist_ok=True)
+                    with open(args["path"], "w", encoding="utf-8") as f:
+                        f.write(args.get("content", ""))
+                    out = {"status": "success"}
+                    all_failed = False
+                elif name == "run_commands":
+                    proc = subprocess.run(args["command"], shell=True, capture_output=True, text=True, timeout=args.get("timeout", 30000)/1000.0)
+                    out = {"stdout": proc.stdout, "stderr": proc.stderr, "exitCode": proc.returncode}
+                    all_failed = False
+                else:
+                    out = {"error": f"Unknown tool: {name}"}
+            except Exception as e:
+                out = {"error": str(e)}
+                
+            tool_results.append({
+                "tool_call_id": tc["id"],
+                "role": "tool",
+                "name": name,
+                "content": json.dumps(out, ensure_ascii=False)
+            })
+
+        messages.extend(tool_results)
+        consecutive_mistakes = consecutive_mistakes + 1 if all_failed else 0
+
+        # Max Mistake Guardrail
+        if consecutive_mistakes >= config["maxConsecutiveMistakes"]:
+            raise ControlledStopError("Max consecutive mistakes limit reached. Aborting run.")
+
+        # Explicit Terminal Tool completed run
+        if run_completed:
+            print("\n[Termination] Run Completed Explicitly via attempt_completion.")
             break
             
-        tool_results = await asyncio.to_thread(_sync_execute_tool_calls, assistant_msg["tool_calls"])
-        messages.extend(tool_results)
     else:
-        print(f"\n[Termination] 達到安全執行步數上限 ({max_steps} 步)，強制退出。")
+        raise RuntimeError(f"Max iterations ({config['maxIterations']}) reached.")
         
+    print("[Hook] afterRun invoked: run-finished")
     return messages
 
 async def test_main():
@@ -244,15 +307,15 @@ async def test_main():
     test_token = "MyTokenHere"
     initial_messages = [
         {"role": "system", "content": SYS_PROMPT},
-        {"role": "user", "content": "Please run the command 'echo Hello World' and also write 'Testing 123' to a file named 'test_output.txt'."}
+        {"role": "user", "content": "write a hello world python code in ./test/demo.py"}
     ]
     
     try:
         final_history = await agent_loop(test_url, test_token, initial_messages)
-        print("\n\n=== 最終對話歷史 ===")
+        print(f"\n=== 最終對話歷史 ===")
         print(final_history)
     except Exception as e:
-        print(f"\n執行失敗: {e}")
+        print(f"\n執行終止: {type(e).__name__} - {e}")
 
 if __name__ == "__main__":
     asyncio.run(test_main())
